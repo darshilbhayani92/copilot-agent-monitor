@@ -4,6 +4,8 @@ A **local, read-only** dashboard that watches every running GitHub Copilot CLI
 session ("agent") on this machine and highlights the ones that are **waiting for
 you**.
 
+![Copilot Agent Monitor dashboard](docs/dashboard.png)
+
 It shows the same live view in two places at once:
 
 - **Terminal** — an auto-refreshing table (rings the bell when an agent starts
