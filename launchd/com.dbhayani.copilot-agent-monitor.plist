@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dbhayani.copilot-agent-monitor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/dbhayani/copilot-agent-monitor/monitor.py</string>
+        <string>--no-terminal</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/copilot-monitor.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/copilot-monitor.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>MONITOR_PORT</key>
+        <string>8787</string>
+    </dict>
+</dict>
+</plist>
