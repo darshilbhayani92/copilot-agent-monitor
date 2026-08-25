@@ -221,8 +221,9 @@ def autopilot_terminal(tty_path, app_name, kind, cmd=APPROVE_CMD):
 
     iTerm2 supports `write text` which targets one session precisely (no risk of
     hitting the wrong window). Terminal.app falls back to focus + System Events
-    keystroke. VS Code/Cursor integrated terminals can't be targeted safely, so
-    they are refused.
+    keystroke. VS Code/Cursor integrated terminals can't be targeted by tty via
+    AppleScript, so we activate the editor and send the keystroke to whichever
+    integrated terminal currently has focus (best-effort).
     """
     safe = cmd.replace('\\', '\\\\').replace('"', '\\"')
     if kind == "iterm":
@@ -260,8 +261,22 @@ def autopilot_terminal(tty_path, app_name, kind, cmd=APPROVE_CMD):
           end repeat
         end tell
         return "notfound"'''
+    elif kind == "vscode":
+        # VS Code/Cursor: AppleScript can't enumerate integrated-terminal tabs by
+        # tty, so bring the editor to the front and type into the focused terminal.
+        # When an agent is blocked on a prompt its terminal panel is normally the
+        # active element, so this reliably lands on the waiting session.
+        app = app_name or "Cursor"
+        script = f'''
+        tell application "{app}" to activate
+        delay 0.25
+        tell application "System Events"
+          keystroke "{safe}"
+          key code 36
+        end tell
+        return "ok"'''
     else:
-        return False, (f"Auto-approve only supports iTerm/Terminal; "
+        return False, (f"Auto-approve only supports iTerm/Terminal/Cursor/VS Code; "
                        f"{app_name or 'this terminal'} must be approved manually.")
     try:
         res = subprocess.run(["osascript", "-e", script],
@@ -873,7 +888,7 @@ async function tick(){
  prevDone=doneIds;started=true;
  // FAST & FURIOUS: auto-send /allow-all to newly permission-blocked agents
  if(ff){
-  const perm=blk.filter(x=>x.state==='WAITING_PERMISSION'&&(x.term_kind==='iterm'||x.term_kind==='terminal'));
+  const perm=blk.filter(x=>x.state==='WAITING_PERMISSION'&&(x.term_kind==='iterm'||x.term_kind==='terminal'||x.term_kind==='vscode'));
   for(const w of perm){if(!autopSent.has(w.id)){autopSent.add(w.id);autoApprove(w);}}
  }
  const permIds=new Set(blk.filter(x=>x.state==='WAITING_PERMISSION').map(x=>x.id));
@@ -959,7 +974,7 @@ function setInt(ms){intervalMs=ms;localStorage.setItem('mon_int',''+ms);updateCo
 function setFX(v){fxOn=v;localStorage.setItem('mon_fx',v?'1':'0');document.body.classList.toggle('nofx',!v);updateControls();
  if(fxOn&&live)startFX();else stopFX();}
 function setFF(v){ff=v;localStorage.setItem('mon_ff',v?'1':'0');autopSent.clear();updateControls();
- audio();toast(v?'\U0001F3CE FAST & FURIOUS \u2014 blocked agents auto-approved via /allow-all (iTerm/Terminal only)':'\U0001F6E1 MANUAL \u2014 you approve every prompt yourself');
+ audio();toast(v?'\U0001F3CE FAST & FURIOUS \u2014 blocked agents auto-approved via /allow-all (iTerm/Terminal/Cursor/VS Code)':'\U0001F6E1 MANUAL \u2014 you approve every prompt yourself');
  if(v)tick();}
 document.getElementById('liveBtn').addEventListener('click',()=>setLive(!live));
 document.getElementById('refreshBtn').addEventListener('click',()=>tick());

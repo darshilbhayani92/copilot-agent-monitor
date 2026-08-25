@@ -40,10 +40,33 @@ Each agent card has two buttons:
 
 The card meta line shows the hosting app + TTY and the working directory.
 
-> **Can I answer the prompt directly in the dashboard?** No. Each Copilot CLI
-> agent reads input from its own interactive terminal; there is no supported API
-> to inject a message from outside. The **Focus terminal** button is the safe,
-> supported way to get to the right tab instantly.
+## 🏎 FAST & FURIOUS mode (auto-approve)
+
+An **opt-in** toggle in the web dashboard. While it is ON, any agent that becomes
+blocked on a `WAITING_PERMISSION` prompt is automatically approved by sending
+Copilot CLI's built-in `/allow-all` command straight into its terminal — you
+never have to touch the yes/no prompt yourself.
+
+How the command reaches each terminal:
+
+- **iTerm2:** targeted precisely via `write text` to the session owning the TTY.
+- **Terminal.app:** the tab is selected by TTY, then the command is typed via
+  System Events.
+- **VS Code / Cursor:** the integrated terminal has no per-tab AppleScript API,
+  so the editor is activated and the command is typed into the **focused**
+  integrated terminal (best-effort — this is normally the terminal that is
+  blocking, since its panel holds focus while it waits).
+
+> **Requires Accessibility permission.** The Terminal.app and Cursor/VS Code
+> paths use System Events keystrokes, so the app hosting the monitor (or
+> `osascript`) must be granted access under **System Settings → Privacy &
+> Security → Accessibility**. Without it, keystrokes are silently dropped.
+
+Leave the toggle OFF (default, "🛡 MANUAL") to approve every prompt yourself.
+
+> **Can I answer an `ask_user` question directly in the dashboard?** No. Free-form
+> questions still require you to type in the agent's own terminal — use **Focus
+> terminal** to jump there. FAST & FURIOUS only auto-answers permission prompts.
 
 ## Run it
 
@@ -82,6 +105,8 @@ It only **reads** local Copilot state under `~/.copilot`:
   `permission.requested/completed`, `ask_user` tool calls, and turn events,
 - reads session titles from `~/.copilot/session-store.db` (read-only).
 
-It never modifies any session, makes no network calls, and contains no
-third-party code — consistent with LinkedIn's Copilot CLI usage policy
+It makes no network calls and contains no third-party code. It does not modify
+any session state or files; the only action that writes anything is the opt-in
+FAST & FURIOUS mode, which types `/allow-all` into an agent's own terminal on
+your behalf — consistent with LinkedIn's Copilot CLI usage policy
 (`go/ai-dev-safely`).
