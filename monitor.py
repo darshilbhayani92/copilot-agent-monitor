@@ -21,6 +21,8 @@ import html
 import json
 import os
 import re
+import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -467,6 +469,206 @@ def build_log(session_id, n=25, nbytes=256 * 1024):
     return lines[-n:]
 
 
+_PR_RE = re.compile(r"https?://github\.com/[^\s\"')]+/pull/\d+")
+_COMMIT_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
+
+
+def build_summary(session_id, max_bytes=8 * 1024 * 1024):
+    """Build a heuristic summary of what a past session accomplished."""
+    path = os.path.join(SESSION_STATE_DIR, session_id, "events.jsonl")
+    if not os.path.exists(path):
+        return None
+    first_user = ""
+    last_assistant = ""
+    user_turns = 0
+    assistant_turns = 0
+    files_created = set()
+    files_edited = set()
+    bash_cmds = []
+    pr_links = set()
+    start_ts = end_ts = None
+
+    try:
+        size = os.path.getsize(path)
+        with open(path, "r", errors="ignore") as f:
+            if size > max_bytes:
+                # read the head (for the first ask) then tail (for outcome)
+                head = f.read(max_bytes // 4)
+                f.seek(size - (max_bytes - max_bytes // 4))
+                f.readline()  # drop partial line
+                chunks = head.splitlines() + f.read().splitlines()
+            else:
+                chunks = f.read().splitlines()
+    except Exception:
+        return None
+
+    for line in chunks:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        t = e.get("type")
+        d = e.get("data") or {}
+        ts = _iso_to_epoch(e.get("timestamp"))
+        if ts:
+            start_ts = ts if start_ts is None else min(start_ts, ts)
+            end_ts = ts if end_ts is None else max(end_ts, ts)
+        if t == "user.message":
+            c = _oneline(d.get("content") or "")
+            if c:
+                user_turns += 1
+                if not first_user:
+                    first_user = c
+                for m in _PR_RE.findall(c):
+                    pr_links.add(m)
+        elif t == "assistant.message":
+            c = _oneline(d.get("content") or d.get("text") or "")
+            if c:
+                assistant_turns += 1
+                last_assistant = c
+                for m in _PR_RE.findall(c):
+                    pr_links.add(m)
+        elif t == "tool.execution_start":
+            name = d.get("toolName")
+            args = d.get("arguments") or {}
+            if name == "create" and args.get("path"):
+                files_created.add(args["path"])
+            elif name == "edit" and args.get("path"):
+                files_edited.add(args["path"])
+            elif name == "bash" and args.get("command"):
+                bash_cmds.append(_oneline(args["command"]))
+        elif t == "tool.execution_complete":
+            res = d.get("result") or {}
+            blob = ""
+            if isinstance(res, dict):
+                blob = json.dumps(res)[:2000]
+            for m in _PR_RE.findall(blob):
+                pr_links.add(m)
+
+    dur = round(end_ts - start_ts) if (start_ts and end_ts) else None
+    return {
+        "first_user": first_user[:600],
+        "last_assistant": last_assistant[:800],
+        "user_turns": user_turns,
+        "assistant_turns": assistant_turns,
+        "files_created": sorted(files_created)[:40],
+        "files_edited": sorted(files_edited)[:40],
+        "files_created_count": len(files_created),
+        "files_edited_count": len(files_edited),
+        "bash_count": len(bash_cmds),
+        "bash_sample": bash_cmds[:8],
+        "pr_links": sorted(pr_links)[:20],
+        "duration_seconds": dur,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Lightweight session briefs + suggestions
+# ---------------------------------------------------------------------------
+_brief_cache = {}  # sid -> (mtime, brief)
+_STOP = {"the", "and", "for", "with", "that", "this", "you", "can", "how",
+         "get", "was", "are", "from", "into", "just", "want", "need", "please",
+         "help", "some", "like", "give", "make", "have", "then", "what", "why"}
+
+
+def _tokens(text):
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(w) >= 3 and w not in _STOP}
+
+
+def session_brief(sid):
+    """Cheap, cached brief of a session for ranking (size + first ask)."""
+    path = os.path.join(SESSION_STATE_DIR, sid, "events.jsonl")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    cached = _brief_cache.get(sid)
+    if cached and cached[0] == st.st_mtime:
+        return cached[1]
+    first_user = ""
+    try:
+        with open(path, "r", errors="ignore") as f:
+            head = f.read(256 * 1024)
+        for line in head.splitlines():
+            if '"user.message"' not in line:
+                continue
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            if e.get("type") == "user.message":
+                c = _oneline((e.get("data") or {}).get("content") or "")
+                if c:
+                    first_user = c
+                    break
+    except Exception:
+        pass
+    brief = {"size": st.st_size, "mtime": st.st_mtime, "first_user": first_user}
+    _brief_cache[sid] = (st.st_mtime, brief)
+    return brief
+
+
+def suggest_sessions(query="", limit=5, scan_limit=60):
+    """Suggest past sessions: ranked by relevance to `query`, else by richness.
+
+    Richness is proxied by event-log size (more activity = richer). Relevance
+    is token overlap between the query and title/first-ask/repo/path.
+    """
+    summaries = load_summaries()
+    cand = history(limit=scan_limit)  # recent, non-live
+    q_tokens = _tokens(query)
+    rows = []
+    max_size = 1
+    briefs = {}
+    for c in cand:
+        b = session_brief(c["id"])
+        if not b:
+            continue
+        briefs[c["id"]] = b
+        max_size = max(max_size, b["size"])
+    for c in cand:
+        b = briefs.get(c["id"])
+        if not b:
+            continue
+        title = c["summary"]
+        hay = " ".join([title, b["first_user"], c.get("repository", ""),
+                        c.get("cwd", "")]).lower()
+        hay_tokens = _tokens(hay)
+        matched = sorted(q_tokens & hay_tokens)
+        # substring boost for multi-word phrases in the query
+        phrase_hit = bool(query.strip()) and query.strip().lower() in hay
+        richness = b["size"] / max_size  # 0..1
+        if q_tokens:
+            rel = len(matched) / len(q_tokens)
+            score = rel * 3 + (1.0 if phrase_hit else 0) + richness
+        else:
+            score = richness
+        rows.append({
+            "id": c["id"],
+            "short": c["short"],
+            "summary": title,
+            "cwd": c.get("cwd", ""),
+            "repository": c.get("repository", ""),
+            "age_seconds": c.get("age_seconds"),
+            "size_kb": round(b["size"] / 1024),
+            "first_user": b["first_user"][:240],
+            "matched": matched,
+            "score": round(score, 3),
+        })
+    if q_tokens:
+        # keep only sessions that matched at least one term when querying
+        matched_rows = [r for r in rows if r["matched"]]
+        pool = matched_rows if matched_rows else rows
+        pool.sort(key=lambda r: (-r["score"], -(r["size_kb"] or 0)))
+        return pool[:limit], bool(matched_rows)
+    rows.sort(key=lambda r: -(r["size_kb"] or 0))
+    return rows[:limit], True
+
+
 def scan():
     """Return a list of agent status dicts for all live sessions."""
     summaries = load_summaries()
@@ -514,6 +716,304 @@ def scan():
     # waiting agents first, then by most recently active
     agents.sort(key=lambda a: (not a["waiting"], -(a["last_ts"] or 0)))
     return agents
+
+
+# ---------------------------------------------------------------------------
+# Session history (previous / non-live sessions)
+# ---------------------------------------------------------------------------
+def _live_session_ids():
+    """Set of session ids that currently have a live process holding the lock."""
+    live = set()
+    if not os.path.isdir(SESSION_STATE_DIR):
+        return live
+    for sid in os.listdir(SESSION_STATE_DIR):
+        sdir = os.path.join(SESSION_STATE_DIR, sid)
+        if os.path.isdir(sdir) and live_pid(sdir) is not None:
+            live.add(sid)
+    return live
+
+
+def load_sessions_full():
+    """Return list of dicts for every session in the store (read-only)."""
+    rows = []
+    try:
+        import sqlite3
+        uri = f"file:{SESSION_STORE_DB}?mode=ro"
+        con = sqlite3.connect(uri, uri=True, timeout=1.0)
+        try:
+            for sid, summary, cwd, repo, branch, created, updated in con.execute(
+                "SELECT id, summary, cwd, repository, branch, created_at, "
+                "updated_at FROM sessions"
+            ):
+                rows.append({
+                    "id": sid,
+                    "summary": summary or "",
+                    "cwd": cwd or "",
+                    "repository": repo or "",
+                    "branch": branch or "",
+                    "created_at": created or "",
+                    "updated_at": updated or "",
+                })
+        finally:
+            con.close()
+    except Exception:
+        pass
+    return rows
+
+
+def history(limit=80):
+    """Return past (non-live) sessions, most-recently-updated first."""
+    live = _live_session_ids()
+    rows = load_sessions_full()
+    out = []
+    for r in rows:
+        if r["id"] in live:
+            continue
+        updated_epoch = _iso_to_epoch(r["updated_at"])
+        has_log = os.path.exists(
+            os.path.join(SESSION_STATE_DIR, r["id"], "events.jsonl"))
+        age = round(time.time() - updated_epoch) if updated_epoch else None
+        out.append({
+            "id": r["id"],
+            "short": r["id"][:8],
+            "summary": r["summary"] or "(untitled session)",
+            "cwd": r["cwd"],
+            "repository": r["repository"],
+            "branch": r["branch"],
+            "updated_at": r["updated_at"],
+            "updated_epoch": updated_epoch,
+            "age_seconds": age,
+            "has_log": has_log,
+        })
+    out.sort(key=lambda x: -(x["updated_epoch"] or 0))
+    return out[:limit]
+
+
+# The CLI binary used to resume a session in a fresh terminal window.
+RESUME_BIN = os.environ.get("MONITOR_COPILOT_BIN", "copilot")
+PRIMER_DIR = os.path.join(COPILOT_DIR, "session-primers")
+
+
+def _open_terminal(inner):
+    """Open a new terminal window running the shell command `inner`.
+
+    Prefers iTerm2 if installed, otherwise falls back to Terminal.app.
+    Returns (ok, app_name, error).
+    """
+    use_iterm = os.path.isdir("/Applications/iTerm.app")
+    safe = inner.replace('\\', '\\\\').replace('"', '\\"')
+    if use_iterm:
+        script = f'''
+        tell application "iTerm2"
+          activate
+          set w to (create window with default profile)
+          tell current session of w to write text "{safe}"
+        end tell
+        return "ok"'''
+    else:
+        script = f'''
+        tell application "Terminal"
+          activate
+          do script "{safe}"
+        end tell
+        return "ok"'''
+    app = "iTerm2" if use_iterm else "Terminal"
+    try:
+        res = subprocess.run(["osascript", "-e", script],
+                             capture_output=True, text=True, timeout=8)
+        if (res.stdout or "").strip() == "ok":
+            return True, app, ""
+        return False, app, (res.stderr or "could not open terminal").strip()[:200]
+    except Exception as e:
+        return False, app, str(e)
+
+
+def resume_session(session_id, cwd="", allow_all=False):
+    """Open a new terminal window running `copilot --resume=<id>`.
+
+    When allow_all is set, `--allow-all-tools` is added so the resumed session
+    auto-approves prompts.
+    """
+    flags = "--allow-all-tools " if allow_all else ""
+    inner = f"{RESUME_BIN} {flags}--resume={shlex.quote(session_id)}"
+    if cwd:
+        inner = f"cd {shlex.quote(cwd)} && {inner}"
+    ok, app, err = _open_terminal(inner)
+    if ok:
+        return True, f"Resuming in a new {app} window{' (allow-all)' if allow_all else ''}."
+    return False, err or "could not open terminal"
+
+
+def context_items(session_id):
+    """Return granular, selectable context suggestions for a past session."""
+    summ = build_summary(session_id)
+    if not summ:
+        return []
+    items = []
+    if summ.get("first_user"):
+        items.append({"key": "ask", "label": "Original ask", "text": summ["first_user"]})
+    if summ.get("last_assistant"):
+        items.append({"key": "outcome", "label": "Last outcome / result",
+                      "text": summ["last_assistant"]})
+    files = (summ.get("files_created") or []) + (summ.get("files_edited") or [])
+    if files:
+        n = summ.get("files_created_count", 0) + summ.get("files_edited_count", 0)
+        items.append({"key": "files", "label": f"Files touched ({n})",
+                      "text": ", ".join(files)})
+    if summ.get("pr_links"):
+        items.append({"key": "prs", "label": "Pull requests",
+                      "text": ", ".join(summ["pr_links"])})
+    if summ.get("bash_sample"):
+        items.append({"key": "commands", "label": "Key commands",
+                      "text": "; ".join(summ["bash_sample"])})
+    return items
+
+
+def _write_primer(blocks):
+    """Write assembled markdown blocks to a primer file; return its path."""
+    if not blocks:
+        return None
+    os.makedirs(PRIMER_DIR, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(PRIMER_DIR, f"primer-{stamp}.md")
+    header = (
+        "# Memory from previous Copilot sessions\n\n"
+        "The following is context the user hand-picked from earlier sessions "
+        "to carry forward into this new session.\n\n")
+    with open(path, "w") as f:
+        f.write(header + "\n\n---\n\n".join(blocks) + "\n")
+    return path
+
+
+def build_primer_from_items(items):
+    """Assemble a primer from explicitly chosen context items.
+
+    Each item is a dict with `title` (session/group heading), `label`, `text`.
+    Items are grouped by title in first-seen order.
+    """
+    groups = {}
+    order = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        text = (it.get("text") or "").strip()
+        if not text:
+            continue
+        title = (it.get("title") or "Context").strip()
+        if title not in groups:
+            groups[title] = []
+            order.append(title)
+        groups[title].append((it.get("label") or "note", text))
+    blocks = []
+    for title in order:
+        lines = [f"## {title}"]
+        for label, text in groups[title]:
+            lines.append(f"- {label}: {text}")
+        blocks.append("\n".join(lines))
+    return _write_primer(blocks)
+
+
+def build_primer(session_ids):
+    """Write a markdown 'memory' file summarizing the given past sessions.
+
+    Returns (primer_path, session_summaries) or (None, []) if nothing usable.
+    """
+    summaries = load_summaries()
+    blocks = []
+    for sid in session_ids:
+        summ = build_summary(sid)
+        title = (summaries.get(sid, ("", ""))[0]) or "(untitled session)"
+        if not summ:
+            continue
+        lines = [f"## {title}", f"- Session id: `{sid}`"]
+        if summ.get("first_user"):
+            lines.append(f"- Original ask: {summ['first_user']}")
+        if summ.get("last_assistant"):
+            lines.append(f"- Last outcome: {summ['last_assistant']}")
+        if summ.get("files_edited") or summ.get("files_created"):
+            files = (summ.get("files_created") or []) + (summ.get("files_edited") or [])
+            lines.append(f"- Files touched: {', '.join(files[:30])}")
+        if summ.get("pr_links"):
+            lines.append(f"- Pull requests: {', '.join(summ['pr_links'])}")
+        if summ.get("bash_sample"):
+            lines.append(f"- Sample commands: {'; '.join(summ['bash_sample'][:6])}")
+        blocks.append("\n".join(lines))
+    if not blocks:
+        return None, []
+    path = _write_primer(blocks)
+    return path, blocks
+
+
+def new_session(session_ids=None, cwd="", task="", allow_all=False, items=None):
+    """Open a new copilot session, optionally seeded with memory from past ones.
+
+    Memory can come from hand-picked context `items` (preferred) or, failing
+    that, whole `session_ids`. A primer file is built and the new interactive
+    session starts with an initial prompt telling copilot to read it.
+    """
+    session_ids = session_ids or []
+    primer_path = None
+    if items:
+        primer_path = build_primer_from_items(items)
+        if not primer_path:
+            return False, "no usable context was selected."
+    elif session_ids:
+        primer_path, _ = build_primer(session_ids)
+        if not primer_path:
+            return False, "could not build a memory primer from those sessions."
+    parts = [RESUME_BIN]
+    if allow_all:
+        parts.append("--allow-all")
+    if primer_path:
+        parts += ["--add-dir", shlex.quote(PRIMER_DIR)]
+        ask = task.strip() or "Continue where these left off — ask me what I want to do next."
+        prompt = (f"Read the memory file {shlex.quote(primer_path)} which "
+                  f"summarizes my previous related Copilot sessions, treat it as "
+                  f"prior context, then help me: {ask}")
+        parts += ["-i", shlex.quote(prompt)]
+    elif task.strip():
+        parts += ["-i", shlex.quote(task.strip())]
+    inner = " ".join(parts)
+    if cwd:
+        inner = f"cd {shlex.quote(cwd)} && {inner}"
+    ok, app, err = _open_terminal(inner)
+    if ok:
+        if items:
+            note = f" seeded with {len(items)} hand-picked context item(s)"
+        elif session_ids:
+            note = f" seeded with memory from {len(session_ids)} session(s)"
+        else:
+            note = ""
+        return True, f"Opened a new Copilot session in {app}{note}."
+    return False, err or "could not open terminal"
+
+
+def delete_session(session_id):
+    """Remove a non-live session: its state dir and its store row (best-effort)."""
+    sdir = os.path.join(SESSION_STATE_DIR, session_id)
+    if os.path.isdir(sdir) and live_pid(sdir) is not None:
+        return False, "session is live — cannot delete a running session."
+    removed = []
+    if os.path.isdir(sdir):
+        try:
+            shutil.rmtree(sdir)
+            removed.append("state")
+        except Exception as e:
+            return False, f"could not remove session state: {e}"
+    try:
+        import sqlite3
+        con = sqlite3.connect(SESSION_STORE_DB, timeout=2.0)
+        try:
+            con.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            con.commit()
+            removed.append("record")
+        finally:
+            con.close()
+    except Exception:
+        pass  # store row deletion is best-effort
+    if not removed:
+        return False, "nothing to delete (session not found)."
+    return True, f"Deleted session ({' + '.join(removed)})."
 
 
 # ---------------------------------------------------------------------------
@@ -611,9 +1111,7 @@ def render_terminal(agents, prev_waiting_ids):
 _latest = {"agents": [], "ts": 0}
 _latest_lock = threading.Lock()
 
-INDEX_HTML = """<!doctype html><html><head><meta charset=utf-8>
-<title>J.A.R.V.I.S. · Copilot Agent Monitor</title>
-<style>
+STYLE = """<style>
  :root{--cy:#22d3ee;--cy2:#7df9ff;--gold:#ffb020;--red:#ff3b47;--grn:#39ffa8;--muted:#7fa7b3;--panel:rgba(8,20,30,.55)}
  *{box-sizing:border-box}
  html,body{height:100%}
@@ -655,6 +1153,8 @@ INDEX_HTML = """<!doctype html><html><head><meta charset=utf-8>
  .ctl{font-family:inherit;font-size:11px;font-weight:700;letter-spacing:1.5px;color:var(--cy2);background:rgba(2,8,14,.8);
    border:1px solid rgba(34,211,238,.4);border-radius:6px;padding:7px 13px;cursor:pointer;transition:.12s}
  .ctl:hover{background:rgba(34,211,238,.16)}
+ a.ctl{text-decoration:none;display:inline-flex;align-items:center}
+ #histLink{border-color:rgba(127,167,179,.5);color:#cfeef6}
  #liveBtn.live{color:#02060c;background:var(--grn);border-color:var(--grn);box-shadow:0 0 12px rgba(57,255,168,.5)}
  #liveBtn.paused{color:var(--gold);border-color:var(--gold);background:rgba(255,176,32,.1)}
  #fxBtn.off{color:var(--muted);border-color:rgba(127,167,179,.4);background:rgba(127,167,179,.06)}
@@ -756,6 +1256,107 @@ INDEX_HTML = """<!doctype html><html><head><meta charset=utf-8>
  .btn.kill:hover{background:rgba(255,59,71,.2);box-shadow:0 0 12px rgba(255,59,71,.5)}
  .btn.log{border-color:rgba(127,167,179,.55);color:#bfe9f2;background:rgba(127,167,179,.08);text-shadow:none}
  .btn.log:hover{background:rgba(127,167,179,.2);box-shadow:0 0 10px rgba(127,167,179,.3)}
+ .btn.send{border-color:var(--gold);color:#ffdf9a;background:rgba(255,176,32,.1);text-shadow:0 0 6px rgba(255,176,32,.5)}
+ .btn.send:hover{background:rgba(255,176,32,.22);box-shadow:0 0 12px rgba(255,176,32,.5)}
+ .replybox{margin-top:12px;display:flex;gap:8px;align-items:stretch}
+ .replyta{flex:1;font-family:inherit;font-size:12.5px;color:#eafbff;background:rgba(1,6,11,.7);
+   border:1px solid rgba(34,211,238,.35);border-radius:4px;padding:8px 10px;outline:none;transition:.14s}
+ .replyta:focus{border-color:var(--cy);box-shadow:0 0 12px rgba(34,211,238,.35)}
+ .replyta::placeholder{color:var(--muted);letter-spacing:.5px}
+ #histsec{margin-top:26px}
+ .histbar{display:flex;align-items:center;gap:14px;margin-bottom:14px;flex-wrap:wrap}
+ .histsearch{flex:1;min-width:220px;font-family:inherit;font-size:12.5px;color:#eafbff;background:rgba(1,6,11,.7);
+   border:1px solid rgba(34,211,238,.3);border-radius:4px;padding:8px 12px;outline:none;transition:.14s}
+ .histsearch:focus{border-color:var(--cy);box-shadow:0 0 12px rgba(34,211,238,.3)}
+ .histsearch::placeholder{color:var(--muted);letter-spacing:.5px}
+ .histcount{font-size:11px;letter-spacing:1.5px;color:var(--muted)}
+ .panel.hist{border-color:rgba(127,167,179,.3);opacity:.94}
+ .panel.hist .title{color:#dff2f7}
+ .hmeta{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px 14px;font-size:11px;color:var(--muted);letter-spacing:.5px}
+ .hmeta b{color:var(--cy2);font-weight:600}
+ .btn.resume{border-color:var(--grn,#39d98a);color:#9af5c6;background:rgba(57,217,138,.1);text-shadow:0 0 6px rgba(57,217,138,.4)}
+ .btn.resume:hover{background:rgba(57,217,138,.22);box-shadow:0 0 12px rgba(57,217,138,.4)}
+ .btn.resumeff{border-color:var(--gold);color:#ffdf9a;background:rgba(255,176,32,.1);text-shadow:0 0 6px rgba(255,176,32,.5)}
+ .btn.resumeff:hover{background:rgba(255,176,32,.22);box-shadow:0 0 12px rgba(255,176,32,.5)}
+ .summbox{padding:14px 16px;font-size:12.5px;line-height:1.55;color:#dbeef4}
+ .sstats{display:flex;flex-wrap:wrap;gap:8px 16px;margin-bottom:12px;font-size:11.5px;color:var(--cy2);letter-spacing:.5px}
+ .sstats span{background:rgba(34,211,238,.08);border:1px solid rgba(34,211,238,.2);border-radius:4px;padding:4px 9px}
+ .srow{margin-top:12px}
+ .slbl{font-size:10px;font-weight:800;letter-spacing:1.5px;color:var(--muted);margin-bottom:5px}
+ .sask{white-space:pre-wrap;word-break:break-word;color:#eafbff;background:rgba(1,6,11,.5);border-left:2px solid rgba(34,211,238,.4);padding:8px 11px;border-radius:0 4px 4px 0;max-height:180px;overflow:auto}
+ .sfiles{display:flex;flex-direction:column;gap:4px}
+ .sfiles code{font-family:inherit;font-size:11.5px;color:#bfe9f2;background:rgba(127,167,179,.08);padding:3px 8px;border-radius:3px;word-break:break-all}
+ .sfiles a{color:var(--gold);word-break:break-all;text-decoration:none}
+ .sfiles a:hover{text-decoration:underline}
+ .smore{color:var(--muted);font-size:11px;padding:3px 4px}
+ .sempty{color:var(--muted);letter-spacing:1px;padding:6px 2px}
+ .newbtn{border-color:var(--grn);color:#9af5c6;background:rgba(57,217,138,.1)}
+ .newbtn:hover{background:rgba(57,217,138,.2)}
+ .panel.hist{position:relative}
+ .panel.picked{border-color:var(--grn);box-shadow:0 0 16px rgba(57,217,138,.25)}
+ .hpick{position:absolute;top:12px;right:14px;display:inline-flex;align-items:center;gap:6px;font-size:10px;
+   letter-spacing:1.5px;font-weight:700;color:var(--muted);cursor:pointer;user-select:none}
+ .hpick input{accent-color:var(--grn);width:15px;height:15px;cursor:pointer}
+ #histgrid{display:flex;flex-direction:column;gap:6px}
+ .hrow{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:12px;
+   padding:8px 12px;border:1px solid rgba(127,167,179,.25);border-radius:7px;
+   background:rgba(4,12,18,.6);transition:border-color .15s,background .15s}
+ .hrow:hover{border-color:rgba(34,211,238,.4);background:rgba(6,16,24,.8)}
+ .hrow.picked{border-color:var(--grn);box-shadow:0 0 12px rgba(57,217,138,.2)}
+ .hrow.open{background:rgba(6,16,24,.85)}
+ .hpick2{display:inline-flex;align-items:center;cursor:pointer}
+ .hpick2 input{accent-color:var(--grn);width:16px;height:16px;cursor:pointer}
+ .hmain{min-width:0}
+ .hmain[data-toggle]{cursor:pointer}
+ .hmain[data-toggle]:hover .htitle{color:var(--cy)}
+ .htitle{font-size:13px;font-weight:600;color:#dff2f7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+ .hmeta2{display:flex;gap:10px;align-items:center;font-size:10.5px;color:var(--muted);letter-spacing:.4px;margin-top:2px;overflow:hidden}
+ .hmeta2 .hr{white-space:nowrap;flex:none}
+ .hmeta2 .hpath{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;opacity:.7;min-width:0}
+ .hacts{display:flex;gap:5px;flex:none}
+ .hacts .btn{padding:5px 9px;font-size:10.5px;min-width:0;letter-spacing:.5px}
+ .hrow .logwrap{grid-column:1/-1;animation:slidein .18s ease}
+ @keyframes slidein{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+ .selbar{position:sticky;bottom:14px;margin-top:16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+   background:rgba(6,18,14,.92);border:1px solid var(--grn);border-radius:8px;padding:12px 16px;
+   box-shadow:0 0 24px rgba(57,217,138,.3);backdrop-filter:blur(6px);z-index:20}
+ .selcount{font-size:11px;font-weight:800;letter-spacing:1.5px;color:#9af5c6}
+ .selbar .histsearch{flex:1;min-width:220px}
+ .selchk{display:inline-flex;align-items:center;gap:6px;font-size:11px;letter-spacing:1px;color:#ffdf9a;cursor:pointer}
+ .selchk input{accent-color:var(--gold);width:15px;height:15px;cursor:pointer}
+ .suggbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 12px}
+ .suggbox{display:none;margin:0 0 18px;border:1px solid rgba(34,211,238,.3);border-radius:8px;
+   background:rgba(3,12,18,.85);box-shadow:0 0 18px rgba(34,211,238,.12) inset;padding:10px 12px}
+ .suggtitle{display:flex;align-items:center;justify-content:space-between;font-size:11px;font-weight:800;
+   letter-spacing:1.4px;color:#8fe9ff;margin:2px 2px 10px}
+ .suggrow{display:flex;align-items:center;gap:12px;padding:9px 4px;border-top:1px solid rgba(34,211,238,.12)}
+ .suggrow:first-of-type{border-top:none}
+ .suggmain{flex:1;min-width:0}
+ .suggname{font-size:13px;font-weight:700;color:#eafbff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+ .suggwhy{font-size:10.5px;letter-spacing:.4px;color:var(--muted);margin-top:2px}
+ .suggask{font-size:11px;color:#bfe9ff;margin-top:4px;opacity:.85;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+ .suggadd{flex:none;white-space:nowrap}
+ .modal{position:fixed;inset:0;background:rgba(1,4,8,.78);backdrop-filter:blur(4px);z-index:60;
+   display:flex;align-items:center;justify-content:center;padding:24px}
+ .modalcard{width:min(880px,96vw);max-height:88vh;display:flex;flex-direction:column;
+   background:rgba(5,14,20,.98);border:1px solid var(--cy);border-radius:12px;
+   box-shadow:0 0 40px rgba(34,211,238,.35)}
+ .modalhead{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;
+   font-size:13px;font-weight:800;letter-spacing:1.4px;color:#8fe9ff;border-bottom:1px solid rgba(34,211,238,.2)}
+ .xbtn{background:none;border:none;color:var(--muted);font-size:16px;cursor:pointer;padding:2px 6px;line-height:1}
+ .xbtn:hover{color:#ff8a8a}
+ .modalhint{padding:10px 20px 4px;font-size:11px;color:var(--muted);letter-spacing:.4px}
+ .composebody{flex:1;overflow:auto;padding:8px 20px 12px}
+ .composebody::-webkit-scrollbar{width:8px}.composebody::-webkit-scrollbar-thumb{background:rgba(34,211,238,.3);border-radius:4px}
+ .cgroup{margin:12px 0;border:1px solid rgba(34,211,238,.2);border-radius:8px;padding:10px 12px;background:rgba(1,6,11,.6)}
+ .cgtitle{font-size:12px;font-weight:800;letter-spacing:1px;color:#9af5c6;margin-bottom:8px}
+ .cgid{font-weight:500;color:var(--muted);letter-spacing:.5px}
+ .citem{display:flex;gap:9px;align-items:flex-start;padding:6px 4px;font-size:12px;color:#dff4ff;cursor:pointer;border-top:1px solid rgba(34,211,238,.08)}
+ .citem:first-of-type{border-top:none}
+ .citem input{accent-color:var(--cy);width:15px;height:15px;margin-top:2px;cursor:pointer;flex:none}
+ .citxt{line-height:1.5}.citxt b{color:#8fe9ff}
+ .modalfoot{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:14px 20px;border-top:1px solid rgba(34,211,238,.2)}
+ .modalfoot .histsearch{flex:1;min-width:220px}
  .logwrap{margin-top:12px;max-height:280px;overflow:auto;border:1px solid rgba(34,211,238,.28);border-radius:5px;
    background:rgba(1,6,11,.75);box-shadow:0 0 12px rgba(34,211,238,.12) inset}
  .logwrap::-webkit-scrollbar{width:8px}.logwrap::-webkit-scrollbar-thumb{background:rgba(34,211,238,.3);border-radius:4px}
@@ -778,7 +1379,11 @@ INDEX_HTML = """<!doctype html><html><head><meta charset=utf-8>
  #banner{display:none;background:linear-gradient(90deg,rgba(255,59,71,.25),rgba(255,59,71,.5),rgba(255,59,71,.25));
    border:1px solid var(--red);color:#ffe3e4;font-weight:800;letter-spacing:2px;padding:12px 16px;border-radius:5px;margin-bottom:16px;
    text-shadow:0 0 8px rgba(255,59,71,.7);animation:alert 1.3s infinite}
-</style></head><body>
+</style>"""
+
+INDEX_HTML = """<!doctype html><html><head><meta charset=utf-8>
+<title>J.A.R.V.I.S. · Copilot Agent Monitor</title>
+""" + STYLE + """</head><body>
 <canvas id=fx></canvas>
 <div class=sweep></div><div class=scan></div>
 <header>
@@ -796,6 +1401,8 @@ INDEX_HTML = """<!doctype html><html><head><meta charset=utf-8>
  </span>
  <button id=refreshBtn class=ctl>\u27F3 REFRESH NOW</button>
  <button id=fxBtn class=ctl>\u2728 FX</button>
+ <button id=newBtn class="ctl newbtn">\uFF0B NEW COPILOT</button>
+ <a href="/history" class=ctl id=histLink>\U0001F5C2 PREVIOUS SESSIONS</a>
  <span class=ffswitch id=ffSwitch>
   <span class="ffside l">\U0001F6E1 MANUAL</span>
   <span class=fftrack><span class=ffknob></span></span>
@@ -811,6 +1418,12 @@ INDEX_HTML = """<!doctype html><html><head><meta charset=utf-8>
 const DOTS=['','.','..','...'];let frame=0;
 let prevDone=new Set();let started=false;let chimeAt=new Map();const REPEAT_MS=20000;
 const expanded=new Set();const logN=new Map();
+const replyDraft=new Map();let replyFocus=null;
+function replyBox(id){
+ return '<div class=replybox><input class=replyta id="reply-'+id+'" data-id="'+id+'" type=text '+
+  'placeholder="Type a reply and press Enter to send\u2026" autocomplete=off spellcheck=false>'+
+  '<button class="btn send" data-id="'+id+'">\u21B5 SEND</button></div>';
+}
 function logOpts(id){const v=logN.get(id)||'25';
  return ['25','50','full'].map(o=>'<button class="segb'+(o===v?' on':'')+'" data-id="'+id+'" data-n="'+o+'">'+(o==='full'?'FULL':o)+'</button>').join('');}
 function fmtAge(s){if(s==null)return'?';if(s<60)return s+'s';if(s<3600)return((s/60)|0)+'m';return((s/3600)|0)+'h';}
@@ -821,6 +1434,7 @@ async function killAgent(id,name){if(!confirm('TERMINATE AGENT?\\n\\n'+name+'\\n
 function card(x){
  const loc=(x.term_app||'?')+' · '+(x.tty||'?');
  const dots=DOTS[frame%4];
+ const canType=(x.term_kind==='iterm'||x.term_kind==='terminal'||x.term_kind==='vscode');
  let icon,cls,statetxt,body;
  if(x.category==='processing'){cls='processing';
   icon='<div class=reactor><span class="r r1"></span><span class="r r2"></span><span class="r r3"></span><span class=core></span></div>';
@@ -831,10 +1445,12 @@ function card(x){
   statetxt='BLOCKED \u00B7 AWAITING YOUR RESPONSE';
   const lbl=x.state==='WAITING_PERMISSION'?'AUTHORIZATION REQUIRED \u2014 approve command':'INPUT REQUIRED \u2014 answer question';
   body='<div class=waitbox><div class=lbl>\u23F3 '+lbl+'</div><div class=q>'+esc(x.waiting_for||x.detail||'')+'</div></div>';
+  if(x.state==='WAITING_QUESTION'&&canType)body+=replyBox(x.id);
  }else{cls='done';
   icon='<div class=doneicon>\u2714</div>';
   statetxt='STANDBY \u00B7 AWAITING NEXT DIRECTIVE';
   body='<div class=detail>\u2714 turn complete \u2014 last transmission: '+esc((x.detail||'').slice(0,240))+'</div>';
+  if(canType)body+=replyBox(x.id);
  }
  return '<div class="panel '+cls+'"><div class=rule></div>'+
   '<div class=head>'+icon+'<div><div class=title>'+esc(x.summary)+'</div><div class="stat '+cls+'">'+statetxt+'</div></div></div>'+
@@ -872,6 +1488,7 @@ async function tick(){
    lane('RUNNING \u00B7 IN PROGRESS','lane-p','\u2699',procArr)+
    lane('BLOCKED \u00B7 NEEDS YOUR INPUT','lane-b','\u270B',blk)+
    lane('COMPLETED \u00B7 AWAITING YOUR NEXT ASK','lane-d','\u2714',doneArr);}
+ restoreReplies();
  const banner=document.getElementById('banner');
  if(blk.length){banner.style.display='block';banner.textContent='\u26A0 '+blk.length+' AGENT(S) BLOCKED \u2014 AWAITING YOUR RESPONSE: '+blk.map(w=>w.summary).join('  \u00B7  ');}
  else banner.style.display='none';
@@ -899,6 +1516,24 @@ async function autoApprove(w){
  try{const r=await(await fetch('/api/autopilot?id='+encodeURIComponent(w.id))).json();
   toast((r.ok?'\U0001F3CE FAST & FURIOUS \u2192 auto-approved ':'auto-approve failed: ')+w.summary+(r.ok?'':' \u2014 '+(r.message||'')));
  }catch(e){toast('auto-approve failed');}
+}
+/* keep reply drafts + focus/caret across the periodic grid re-render */
+function restoreReplies(){
+ document.querySelectorAll('.replyta').forEach(ta=>{
+  const id=ta.dataset.id;const d=replyDraft.get(id);if(d!=null)ta.value=d;
+  if(replyFocus===id){ta.focus();const n=ta.value.length;try{ta.setSelectionRange(n,n);}catch(e){}}
+ });
+}
+async function sendReply(id){
+ const ta=document.getElementById('reply-'+id);
+ const msg=((replyDraft.get(id)!=null?replyDraft.get(id):(ta?ta.value:''))||'').trim();
+ if(!msg){toast('reply is empty');return;}
+ try{const r=await(await fetch('/api/reply?id='+encodeURIComponent(id),
+   {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg})})).json();
+  if(r.ok){toast('\u21B5 reply sent');replyDraft.delete(id);if(replyFocus===id)replyFocus=null;
+   if(ta)ta.value='';setTimeout(tick,450);}
+  else toast('reply failed'+(r.message?' \u2014 '+r.message:''));
+ }catch(e){toast('reply failed');}
 }
 async function refreshOpenLogs(){
  for(const id of expanded){
@@ -931,7 +1566,22 @@ document.getElementById('grid').addEventListener('pointerdown',e=>{
   if(wrap){wrap.style.display=on?'':'none';}l.textContent=on?'\u25BE HIDE LOG':'\u25B8 SHOW LOG';
   if(on)refreshOpenLogs();return;}
  const f=e.target.closest('.btn.focus');if(f){e.preventDefault();focusAgent(f.dataset.id);return;}
+ const s=e.target.closest('.btn.send');if(s){e.preventDefault();sendReply(s.dataset.id);return;}
  const k=e.target.closest('.btn.kill');if(k){e.preventDefault();killAgent(k.dataset.id,k.dataset.name);return;}
+});
+/* reply input: track draft text, focus, and Enter-to-send across re-renders */
+document.getElementById('grid').addEventListener('input',e=>{
+ const ta=e.target.closest('.replyta');if(ta)replyDraft.set(ta.dataset.id,ta.value);
+});
+document.getElementById('grid').addEventListener('focusin',e=>{
+ const ta=e.target.closest('.replyta');if(ta)replyFocus=ta.dataset.id;
+});
+document.getElementById('grid').addEventListener('focusout',e=>{
+ const ta=e.target.closest('.replyta');if(ta&&replyFocus===ta.dataset.id)replyFocus=null;
+});
+document.getElementById('grid').addEventListener('keydown',e=>{
+ const ta=e.target.closest('.replyta');if(!ta)return;
+ if(e.key==='Enter'){e.preventDefault();sendReply(ta.dataset.id);}
 });
 window.addEventListener('pointerdown',()=>audio(),{once:true});
 window.addEventListener('keydown',()=>audio(),{once:true});
@@ -980,11 +1630,267 @@ document.getElementById('liveBtn').addEventListener('click',()=>setLive(!live));
 document.getElementById('refreshBtn').addEventListener('click',()=>tick());
 document.getElementById('fxBtn').addEventListener('click',()=>setFX(!fxOn));
 document.getElementById('ffSwitch').addEventListener('click',()=>setFF(!ff));
+document.getElementById('newBtn').addEventListener('click',async()=>{
+ const task=prompt('Start a new Copilot session.\\n\\nOptional first instruction (leave blank for a plain session):','')||'';
+ try{const r=await(await fetch('/api/new-session',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({task:task})})).json();toast(r.message||(r.ok?'opening\u2026':'failed'));
+ }catch(e){toast('could not start session');}
+});
 document.getElementById('intgrp').addEventListener('click',e=>{const b=e.target.closest('.segb2');if(b)setInt(parseInt(b.dataset.int,10));});
 document.body.classList.toggle('nofx',!fxOn);
 updateControls();
 tick();
 if(live){schedule();if(fxOn)startFX();}
+</script></body></html>"""
+
+
+HISTORY_HTML = """<!doctype html><html><head><meta charset=utf-8>
+<title>Previous Sessions · Copilot Agent Monitor</title>
+""" + STYLE + """</head><body class=nofx>
+<header>
+ <div class=reactor-lg><span class="r r1"></span><span class="r r2"></span><span class="r r3"></span><span class=core></span></div>
+ <div><h1>J.A.R.V.I.S. <b>//</b> SESSION ARCHIVE</h1><div class=tag>COPILOT CLI \u00B7 PREVIOUS SESSIONS \u2014 RESUME / REVIEW / CLEAN UP</div></div>
+ <div class=clock id=clock>--<small>ARCHIVE</small></div>
+</header>
+<div class=controls>
+ <a href="/" class=ctl>\u2190 BACK TO LIVE DASHBOARD</a>
+ <button id=refreshBtn class=ctl>\u27F3 REFRESH</button>
+ <input id=histSearch class=histsearch type=text placeholder="Filter by title, repo, or path\u2026" autocomplete=off spellcheck=false>
+ <span class=ctlhint id=histCount></span>
+</div>
+<div class=suggbar>
+ <input id=suggQ class=histsearch type=text placeholder="Describe what you\u2019re about to work on \u2192 get suggested sessions to reuse\u2026" autocomplete=off spellcheck=false>
+ <button id=suggBtn class="ctl newbtn">\U0001F50E SUGGEST</button>
+ <button id=richBtn class=ctl>\u2B50 TOP RICH</button>
+</div>
+<div id=suggbox class=suggbox></div>
+<div class=grid id=histgrid><div class=empty>LOADING PREVIOUS SESSIONS\u2026</div></div>
+<div id=selbar class=selbar style=display:none>
+ <span class=selcount id=selCount></span>
+ <button id=selStart class="btn resume">\U0001F9E0 COMPOSE MEMORY \u2192</button>
+ <button id=selClear class="btn log">CLEAR</button>
+</div>
+<div id=composeModal class=modal style=display:none>
+ <div class=modalcard>
+  <div class=modalhead>\U0001F9E0 COMPOSE MEMORY FOR NEW SESSION<button id=composeClose class=xbtn>\u2715</button></div>
+  <div class=modalhint>Pick the exact context to copy from each selected session. Only checked items are carried into the new session.</div>
+  <div id=composeBody class=composebody>loading\u2026</div>
+  <div class=modalfoot>
+   <input id=composeTask class=histsearch type=text placeholder="What should the new session do? (optional)" autocomplete=off spellcheck=false>
+   <label class=selchk><input type=checkbox id=composeAllow> \U0001F3CE allow-all</label>
+   <button id=composeStart class="btn resume">\u25B6 START NEW SESSION</button>
+  </div>
+ </div>
+</div>
+<div class=toast id=toast></div>
+<script>
+const expanded=new Set();const logN=new Map();const selected=new Set();
+let histData=[];let histFilter='';
+function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),3500);}
+function fmtAgeLong(s){if(s==null)return'?';if(s<60)return s+'s ago';if(s<3600)return((s/60)|0)+'m ago';
+ if(s<86400)return((s/3600)|0)+'h ago';return((s/86400)|0)+'d ago';}
+function logOpts(id){const v=logN.get(id)||'25';
+ return ['25','50','full'].map(o=>'<button class="segb'+(o===v?' on':'')+'" data-id="'+id+'" data-n="'+o+'">'+(o==='full'?'FULL':o)+'</button>').join('');}
+function fmtDur(s){if(s==null)return'?';if(s<60)return s+'s';if(s<3600)return((s/60)|0)+'m';return((s/3600)|0)+'h'+(((s%3600)/60)|0)+'m';}
+function histCard(x){
+ const sel=selected.has(x.id);
+ const exp=expanded.has(x.id);
+ const summbtn=x.has_log?'<button class="btn log" data-id="'+x.id+'">'+(exp?'\u25BE SUMMARY':'\u25B8 SUMMARY')+'</button>':'';
+ const meta=(x.repository?'<span class=hr>\u2325 '+esc(x.repository)+(x.branch?'@'+esc(x.branch):'')+'</span>':'')+
+  '<span class=hr>'+x.short+'</span><span class=hr>'+fmtAgeLong(x.age_seconds)+'</span>';
+ return '<div class="hrow'+(sel?' picked':'')+(exp?' open':'')+'" data-id="'+x.id+'">'+
+  '<label class=hpick2 title="add to memory"><input type=checkbox class=hsel data-id="'+x.id+'"'+(sel?' checked':'')+'></label>'+
+  '<div class=hmain'+(x.has_log?' data-toggle="'+x.id+'"':'')+'>'+
+   '<div class=htitle>'+esc(x.summary)+'</div>'+
+   '<div class=hmeta2>'+meta+'<span class=hpath>'+esc(x.cwd||'')+'</span></div>'+
+  '</div>'+
+  '<div class=hacts>'+
+   summbtn+
+   '<button class="btn resume" data-id="'+x.id+'">\u25B6 RESUME</button>'+
+   '<button class="btn resumeff" data-id="'+x.id+'">\U0001F3CE ALLOW-ALL</button>'+
+   '<button class="btn kill" data-id="'+x.id+'" data-name="'+esc(x.summary)+'">\u2715 DELETE</button>'+
+  '</div>'+
+  '<div class=logwrap id="summ-'+x.id+'"'+(exp?'':' style=display:none')+'>'+
+   '<div class=summbox id="summbox-'+x.id+'">loading summary\u2026</div></div>'+
+  '</div>';
+}
+function fileList(title,arr,total){
+ if(!arr||!arr.length)return'';
+ const more=total>arr.length?' <span class=smore>+'+(total-arr.length)+' more</span>':'';
+ return '<div class=srow><div class=slbl>'+title+' ('+total+')</div><div class=sfiles>'+
+  arr.map(p=>'<code>'+esc(p)+'</code>').join('')+more+'</div></div>';
+}
+function renderSummary(s){
+ if(!s)return'<div class=sempty>No summary available.</div>';
+ const stats='<div class=sstats>'+
+  '<span>\U0001F5E3 '+s.user_turns+' asks</span>'+
+  '<span>\U0001F916 '+s.assistant_turns+' replies</span>'+
+  '<span>\U0001F4C4 +'+s.files_created_count+' new</span>'+
+  '<span>\u270F '+s.files_edited_count+' edited</span>'+
+  '<span>\u2699 '+s.bash_count+' commands</span>'+
+  '<span>\u23F1 '+fmtDur(s.duration_seconds)+'</span></div>';
+ let html=stats;
+ if(s.first_user)html+='<div class=srow><div class=slbl>ORIGINAL ASK</div><div class=sask>'+esc(s.first_user)+'</div></div>';
+ if(s.last_assistant)html+='<div class=srow><div class=slbl>OUTCOME \u00B7 LAST MESSAGE</div><div class=sask>'+esc(s.last_assistant)+'</div></div>';
+ html+=fileList('CREATED',s.files_created,s.files_created_count);
+ html+=fileList('EDITED',s.files_edited,s.files_edited_count);
+ if(s.pr_links&&s.pr_links.length)html+='<div class=srow><div class=slbl>PULL REQUESTS</div><div class=sfiles>'+
+  s.pr_links.map(u=>'<a href="'+esc(u)+'" target=_blank rel=noopener>'+esc(u)+'</a>').join('')+'</div></div>';
+ if(s.bash_sample&&s.bash_sample.length)html+='<div class=srow><div class=slbl>SAMPLE COMMANDS</div><div class=sfiles>'+
+  s.bash_sample.map(c=>'<code>'+esc(c)+'</code>').join('')+'</div></div>';
+ return html;
+}
+function renderHistory(){
+ const grid=document.getElementById('histgrid');
+ const q=histFilter.trim().toLowerCase();
+ const items=q?histData.filter(x=>((x.summary||'')+' '+(x.repository||'')+' '+(x.branch||'')+' '+(x.cwd||'')).toLowerCase().includes(q)):histData;
+ document.getElementById('histCount').textContent=items.length+' / '+histData.length+' SESSION(S)';
+ grid.innerHTML=items.length?items.map(histCard).join(''):'<div class=empty>'+(histData.length?'NO SESSIONS MATCH FILTER':'NO PREVIOUS SESSIONS')+'</div>';
+ for(const id of expanded)fetchSummary(id);
+ updateSelBar();
+}
+function updateSelBar(){
+ const bar=document.getElementById('selbar');const n=selected.size;
+ bar.style.display=n?'flex':'none';
+ document.getElementById('selCount').textContent=n+' SELECTED';
+ if(document.getElementById('suggbox').style.display!=='none')renderSuggState();
+}
+let composeData=[];
+async function fetchSuggest(q){
+ const box=document.getElementById('suggbox');
+ box.style.display='block';box.innerHTML='<div class=sempty>finding relevant sessions\u2026</div>';
+ try{const r=await(await fetch('/api/suggest?limit=5&q='+encodeURIComponent(q||''))).json();
+  renderSugg(r);
+ }catch(e){box.innerHTML='<div class=sempty>could not load suggestions</div>';}
+}
+function renderSugg(r){
+ const box=document.getElementById('suggbox');
+ const rows=r.sessions||[];
+ const head='<div class=suggtitle>'+(r.query?('SUGGESTED FOR: \u201C'+esc(r.query)+'\u201D'+(r.matched?'':' \u2014 no keyword match, showing richest')):'TOP RICH SESSIONS')+
+  ' <button id=suggHide class=xbtn>\u2715</button></div>';
+ if(!rows.length){box.innerHTML=head+'<div class=sempty>no sessions found</div>';return;}
+ box.innerHTML=head+rows.map(x=>{
+  const on=selected.has(x.id);
+  const why=(x.matched&&x.matched.length)?('matches: '+x.matched.map(esc).join(', ')):(x.size_kb+' KB of activity');
+  return '<div class=suggrow>'+
+   '<div class=suggmain><div class=suggname>'+esc(x.summary)+'</div>'+
+    '<div class=suggwhy>'+why+' \u00B7 '+esc(x.repository||x.cwd||'')+' \u00B7 '+fmtAgeLong(x.age_seconds)+'</div>'+
+    (x.first_user?'<div class=suggask>'+esc(x.first_user)+'</div>':'')+'</div>'+
+   '<button class="btn '+(on?'log':'resume')+' suggadd" data-id="'+x.id+'">'+(on?'\u2713 ADDED':'\uFF0B ADD')+'</button>'+
+  '</div>';
+ }).join('');
+}
+async function openCompose(){
+ if(!selected.size){toast('select or add sessions first');return;}
+ const modal=document.getElementById('composeModal');modal.style.display='flex';
+ const body=document.getElementById('composeBody');body.innerHTML='<div class=sempty>loading context\u2026</div>';
+ try{const r=await(await fetch('/api/context?ids='+[...selected].map(encodeURIComponent).join(','))).json();
+  composeData=r.sessions||[];renderCompose();
+ }catch(e){body.innerHTML='<div class=sempty>could not load context</div>';}
+}
+function renderCompose(){
+ const body=document.getElementById('composeBody');
+ if(!composeData.length){body.innerHTML='<div class=sempty>no context found</div>';return;}
+ body.innerHTML=composeData.map((s,si)=>
+  '<div class=cgroup><div class=cgtitle>'+esc(s.title)+' <span class=cgid>'+s.short+'</span></div>'+
+   (s.items.length?s.items.map((it,ii)=>
+    '<label class=citem><input type=checkbox class=cchk data-si="'+si+'" data-ii="'+ii+'" checked>'+
+     '<span class=citxt><b>'+esc(it.label)+':</b> '+esc(it.text.slice(0,320))+(it.text.length>320?'\u2026':'')+'</span></label>'
+   ).join(''):'<div class=sempty>no extractable context</div>')+
+  '</div>').join('');
+}
+async function composeStart(){
+ const items=[];
+ document.querySelectorAll('#composeBody .cchk').forEach(cb=>{
+  if(!cb.checked)return;const s=composeData[cb.dataset.si];const it=s.items[cb.dataset.ii];
+  items.push({title:s.title,label:it.label,text:it.text});
+ });
+ if(!items.length){toast('check at least one context item');return;}
+ const first=histData.find(x=>x.id===composeData[0].id);
+ const body={items:items,task:document.getElementById('composeTask').value||'',
+  allow_all:document.getElementById('composeAllow').checked,cwd:(first&&first.cwd)||''};
+ toast('building memory & opening new session\u2026');
+ try{const r=await(await fetch('/api/new-session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+  toast(r.message||(r.ok?'opening\u2026':'failed'));
+  if(r.ok){document.getElementById('composeModal').style.display='none';selected.clear();renderHistory();}
+ }catch(e){toast('could not start session');}
+}
+async function fetchHistory(){
+ try{const r=await(await fetch('/api/history')).json();histData=r.sessions||[];renderHistory();}
+ catch(e){document.getElementById('histgrid').innerHTML='<div class=empty>MONITOR OFFLINE</div>';}
+}
+async function fetchSummary(id){
+ const box=document.getElementById('summbox-'+id);if(!box)return;
+ try{const r=await(await fetch('/api/summary?id='+encodeURIComponent(id))).json();
+  box.innerHTML=r.ok?renderSummary(r.summary):'<div class=sempty>'+esc(r.message||'no summary')+'</div>';
+ }catch(e){box.innerHTML='<div class=sempty>could not load summary</div>';}
+}
+async function resumeSession(id,allow){
+ try{const r=await(await fetch('/api/resume?id='+encodeURIComponent(id)+(allow?'&allow=1':''))).json();
+  toast(r.message||(r.ok?'resuming\u2026':'resume failed'));
+ }catch(e){toast('resume failed');}
+}
+async function deleteSession(id,name){
+ if(!confirm('DELETE SESSION?\\n\\n'+name+'\\n\\nRemoves its local state and store record. This cannot be undone.'))return;
+ try{const r=await(await fetch('/api/delete?id='+encodeURIComponent(id),{method:'POST'})).json();
+  toast(r.message||(r.ok?'deleted':'delete failed'));
+  if(r.ok){histData=histData.filter(x=>x.id!==id);expanded.delete(id);renderHistory();}
+ }catch(e){toast('delete failed');}
+}
+function toggleSummary(id){
+ if(expanded.has(id))expanded.delete(id);else expanded.add(id);
+ const on=expanded.has(id);const wrap=document.getElementById('summ-'+id);
+ if(wrap)wrap.style.display=on?'':'none';
+ const btn=document.querySelector('.btn.log[data-id="'+id+'"]');
+ if(btn)btn.textContent=on?'\u25BE SUMMARY':'\u25B8 SUMMARY';
+ const row=document.querySelector('.hrow[data-id="'+id+'"]');if(row)row.classList.toggle('open',on);
+ if(on)fetchSummary(id);
+}
+document.getElementById('histgrid').addEventListener('pointerdown',e=>{
+ const l=e.target.closest('.btn.log');if(l){e.preventDefault();toggleSummary(l.dataset.id);return;}
+ const hm=e.target.closest('.hmain[data-toggle]');if(hm){e.preventDefault();toggleSummary(hm.dataset.toggle);return;}
+ const rf=e.target.closest('.btn.resumeff');if(rf){e.preventDefault();resumeSession(rf.dataset.id,true);return;}
+ const r=e.target.closest('.btn.resume');if(r){e.preventDefault();resumeSession(r.dataset.id,false);return;}
+ const k=e.target.closest('.btn.kill');if(k){e.preventDefault();deleteSession(k.dataset.id,k.dataset.name);return;}
+});
+document.getElementById('histSearch').addEventListener('input',e=>{histFilter=e.target.value;renderHistory();});
+document.getElementById('histgrid').addEventListener('change',e=>{
+ const cb=e.target.closest('.hsel');if(!cb)return;const id=cb.dataset.id;
+ if(cb.checked)selected.add(id);else selected.delete(id);
+ const panel=cb.closest('.hrow');if(panel)panel.classList.toggle('picked',cb.checked);
+ updateSelBar();
+});
+document.getElementById('selStart').addEventListener('click',openCompose);
+document.getElementById('selClear').addEventListener('click',()=>{selected.clear();renderHistory();});
+document.getElementById('refreshBtn').addEventListener('click',fetchHistory);
+document.getElementById('suggBtn').addEventListener('click',()=>fetchSuggest(document.getElementById('suggQ').value));
+document.getElementById('richBtn').addEventListener('click',()=>{document.getElementById('suggQ').value='';fetchSuggest('');});
+let suggTimer=null;
+document.getElementById('suggQ').addEventListener('input',e=>{
+ const v=e.target.value;clearTimeout(suggTimer);
+ suggTimer=setTimeout(()=>fetchSuggest(v),250);
+});
+document.getElementById('suggQ').addEventListener('keydown',e=>{if(e.key==='Enter'){clearTimeout(suggTimer);fetchSuggest(e.target.value);}});
+document.getElementById('suggbox').addEventListener('click',e=>{
+ if(e.target.closest('#suggHide')){document.getElementById('suggbox').style.display='none';return;}
+ const a=e.target.closest('.suggadd');if(!a)return;const id=a.dataset.id;
+ if(selected.has(id))selected.delete(id);else selected.add(id);
+ renderHistory();renderSuggState();
+});
+function renderSuggState(){
+ document.querySelectorAll('#suggbox .suggadd').forEach(a=>{
+  const on=selected.has(a.dataset.id);
+  a.textContent=on?'\u2713 ADDED':'\uFF0B ADD';
+  a.classList.toggle('resume',!on);a.classList.toggle('log',on);
+ });
+}
+document.getElementById('composeClose').addEventListener('click',()=>{document.getElementById('composeModal').style.display='none';});
+document.getElementById('composeModal').addEventListener('click',e=>{if(e.target.id==='composeModal')e.target.style.display='none';});
+document.getElementById('composeStart').addEventListener('click',composeStart);
+fetchHistory();
+fetchSuggest('');
+setInterval(fetchHistory,15000);
 </script></body></html>"""
 
 
@@ -1034,6 +1940,18 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "lines": build_log(sid, n, nbytes)})
             return
 
+        if path == "/api/summary":
+            sid = (qs.get("id") or [""])[0]
+            if not sid or not os.path.isdir(os.path.join(SESSION_STATE_DIR, sid)):
+                self._json({"ok": False, "message": "unknown session"}, 404)
+                return
+            summ = build_summary(sid)
+            if summ is None:
+                self._json({"ok": False, "message": "no activity recorded"}, 404)
+                return
+            self._json({"ok": True, "summary": summ})
+            return
+
         if path == "/api/focus":
             sid = (qs.get("id") or [""])[0]
             a = self._agent_by_id(sid)
@@ -1067,12 +1985,134 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": ok, "message": msg})
             return
 
+        if path == "/api/history":
+            self._json({"ok": True, "sessions": history()})
+            return
+
+        if path == "/api/suggest":
+            q = (qs.get("q") or [""])[0]
+            try:
+                lim = int((qs.get("limit") or ["5"])[0])
+            except ValueError:
+                lim = 5
+            lim = max(1, min(lim, 15))
+            rows, matched = suggest_sessions(q, lim)
+            self._json({"ok": True, "query": q, "matched": matched,
+                        "sessions": rows})
+            return
+
+        if path == "/api/context":
+            ids = [x for x in (qs.get("ids") or [""])[0].split(",") if x]
+            summaries = load_summaries()
+            out = []
+            for sid in ids[:20]:
+                if not os.path.isdir(os.path.join(SESSION_STATE_DIR, sid)):
+                    continue
+                out.append({
+                    "id": sid,
+                    "short": sid[:8],
+                    "title": (summaries.get(sid, ("", ""))[0]) or "(untitled session)",
+                    "items": context_items(sid),
+                })
+            self._json({"ok": True, "sessions": out})
+            return
+
+        if path == "/history":
+            body = HISTORY_HTML.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if path == "/api/resume":
+            sid = (qs.get("id") or [""])[0]
+            allow = (qs.get("allow") or ["0"])[0] in ("1", "true", "yes")
+            row = None
+            for r in load_sessions_full():
+                if r["id"] == sid:
+                    row = r
+                    break
+            if not row and not os.path.isdir(os.path.join(SESSION_STATE_DIR, sid)):
+                self._json({"ok": False, "message": "unknown session"}, 404)
+                return
+            ok, msg = resume_session(sid, (row or {}).get("cwd", ""), allow)
+            self._json({"ok": ok, "message": msg})
+            return
+
         body = INDEX_HTML.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path, qs = parsed.path, parse_qs(parsed.query)
+
+        if path == "/api/reply":
+            sid = (qs.get("id") or [""])[0]
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+                payload = json.loads(raw or b"{}")
+            except Exception:
+                payload = {}
+            msg = ""
+            if isinstance(payload, dict):
+                msg = (payload.get("message") or "").strip()
+            # Reply is typed into the agent's terminal + Enter, which submits it
+            # to Copilot CLI as one message, so collapse newlines/tabs to spaces
+            # (they would otherwise break AppleScript or submit early).
+            msg = msg.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+            a = self._agent_by_id(sid)
+            if not a:
+                self._json({"ok": False, "message": "agent not found"}, 404)
+                return
+            if not msg:
+                self._json({"ok": False, "message": "empty reply"}, 400)
+                return
+            ok, m = autopilot_terminal(a.get("tty"), a.get("term_app"),
+                                       a.get("term_kind"), cmd=msg)
+            self._json({"ok": ok, "message": m})
+            return
+
+        if path == "/api/delete":
+            sid = (qs.get("id") or [""])[0]
+            if not sid:
+                self._json({"ok": False, "message": "missing id"}, 400)
+                return
+            ok, m = delete_session(sid)
+            self._json({"ok": ok, "message": m})
+            return
+
+        if path == "/api/new-session":
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+                payload = json.loads(raw or b"{}")
+            except Exception:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            ids = payload.get("session_ids") or []
+            if not isinstance(ids, list):
+                ids = []
+            ids = [str(x) for x in ids][:20]
+            items = payload.get("items") or []
+            if not isinstance(items, list):
+                items = []
+            items = items[:100]
+            cwd = (payload.get("cwd") or "").strip()
+            task = (payload.get("task") or "").strip()
+            allow = bool(payload.get("allow_all"))
+            ok, m = new_session(ids, cwd, task, allow, items=items)
+            self._json({"ok": ok, "message": m})
+            return
+
+        self._json({"ok": False, "message": "not found"}, 404)
 
 
 def start_web():
